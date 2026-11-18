@@ -1,0 +1,49 @@
+{
+  "name": "@local/method-library",
+  "version": "0.2.4",
+  "private": true,
+  "type": "module",
+  "description": "本地方法库：把重复做过的事沉淀成可搜索、可执行的「方法卡片」。AI 搜索命中后拿到填好参数的命令或步骤自行执行，结果回报入库，方法过时可自动修正。每个会话可单独开关（关掉后 AI 看不到工具、提示词不注入），也可单独指定库目录；库默认就是纯文件，位置面里可选。",
+  "author": {
+    "name": "Root-7-KHX"
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "method",
+    "library",
+    "reuse",
+    "playbook",
+    "search"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "docs",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

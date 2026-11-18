@@ -1,0 +1,8 @@
+# 运行期数据（方法库内容、会话开关状态、日志），不入库
+data/
+node_modules/
+*.log
+*.bak
+.DS_Store
+Thumbs.db
+tmp/

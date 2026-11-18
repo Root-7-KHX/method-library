@@ -1,0 +1,16 @@
+# 方法库（@local/method-library）
+# 插件行：工具 + 面板接口 + 系统提示里的一小段用法说明。
+- insert:
+    - id: method-library
+      name: '@local/method-library'
+      config:
+        # 方法库存放目录；留空 = 插件目录下的 data/library
+        libraryDir: ''
+        # method_search 默认返回条数
+        searchLimit: 5
+        # draft 状态的卡片超过这么多天没动，就在面板里提示归档
+        draftDays: 90
+        # 是否在系统提示里注入用法说明（关掉可省 token，但 AI 可能想不起来搜索）
+        promptHint: true
+        # 新对话默认是否开启方法库。默认 false：新对话要手动在面板里打开
+        defaultSessionEnabled: false

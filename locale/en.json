@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Method library",
+    "description": "Turns repeatedly performed chores into searchable, reusable method cards: the agent searches, receives a ready-to-run command or step list, executes it itself and reports back; stale methods can be fixed by the agent. Every conversation can be switched on or off and given its own library folder (same conversation-switching shape as AI memory). Plain-file storage, with an editable panel that only assembles commands and never runs them.",
+    "detail": "docs/DETAIL.md"
+  }
+}
