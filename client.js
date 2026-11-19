@@ -25,6 +25,25 @@ window.__ModuleLoader__.load({
     const RISK_LABEL = { low: '低风险', medium: '中风险', high: '高风险' }
     const RUNTIMES = ['pwsh', 'bash', 'node', 'python']
 
+    // 分组（分类）顺序：类型 脚本→步骤→混合，其余按状态/风险从「正常」往「异常」排
+    const GROUP_ORDER = {
+      kind: { script: 0, playbook: 1, hybrid: 2 },
+      status: { active: 0, draft: 1, disabled: 2, archived: 3 },
+      risk: { low: 0, medium: 1, high: 2 },
+    }
+    const GROUP_MODE_LABEL = { kind: '类型', tag: '标签', status: '状态', risk: '风险', none: '全部' }
+    const UNTAGGED_LABEL = '未分类'
+    const GROUP_STORE_KEY = 'method-library:groupBy'
+
+    function readStoredGroupBy() {
+      try {
+        const saved = window.localStorage.getItem(GROUP_STORE_KEY)
+        return saved && GROUP_MODE_LABEL[saved] ? saved : 'kind'
+      } catch {
+        return 'kind'
+      }
+    }
+
     let apiBase = ''
 
     function withSession(pathname, sessionId) {
@@ -305,8 +324,13 @@ window.__ModuleLoader__.load({
       const [seedCopy, setSeedCopy] = useState(true)
       const [pickerOpen, setPickerOpen] = useState(false)
       const [expandedGroups, setExpandedGroups] = useState({})
+      const [groupBy, setGroupBy] = useState(readStoredGroupBy)
+      const [foldedCats, setFoldedCats] = useState({})
       const [versions, setVersions] = useState([])
       const [versionPick, setVersionPick] = useState('')
+      // P2 自动捕获：AI 搜不到的事（面板里可一键转草稿）
+      const [misses, setMisses] = useState([])
+      const [missesOpen, setMissesOpen] = useState(false)
       const fileInputRef = useRef(null)
       const viewRef = useRef('')
 
@@ -362,9 +386,40 @@ window.__ModuleLoader__.load({
         await loadOverview(target)
       }, [loadSessions, loadOverview])
 
+      // 「AI 搜不到的事」清单：换会话/刷新时顺带拉一次（全局数据，不分库）
+      const loadMisses = useCallback(async () => {
+        try {
+          const data = await request('/misses', { session: viewRef.current })
+          setMisses(Array.isArray(data && data.items) ? data.items : [])
+        } catch {
+          setMisses([])
+        }
+      }, [])
+
+      const handleMiss = useCallback(
+        async (query, discard) => {
+          try {
+            await request('/miss', { method: 'POST', body: JSON.stringify({ query, discard: discard === true, session: viewRef.current }) })
+            await loadMisses()
+            if (!discard) {
+              await refresh()
+              setMessage({ kind: 'ok', text: '「' + query + '」已转成草稿，补一下步骤和参数就能用。' })
+            }
+          } catch (error) {
+            setMessage({ kind: 'error', text: error && error.message ? error.message : String(error) })
+          }
+        },
+        [refresh, loadMisses],
+      )
+
       useEffect(() => {
         void bootstrap()
       }, [bootstrap])
+
+      // 捕获清单是全局的，但要在会话确定之后拉（带 session 参数走后端鉴权）
+      useEffect(() => {
+        void loadMisses()
+      }, [loadMisses, viewSession])
 
       const pickSession = useCallback(
         async (sessionId) => {
@@ -399,6 +454,50 @@ window.__ModuleLoader__.load({
           return hay.includes(text)
         })
       }, [methods, query, statusFilter, onlyIssues])
+
+      // 分类：把过滤后的方法按 类型 / 标签 / 状态 / 风险 分组，组内保持原顺序
+      const groups = useMemo(() => {
+        if (groupBy === 'none') return [{ key: '__all__', label: '全部方法', items: filtered }]
+        const bucket = new Map()
+        const order = GROUP_ORDER[groupBy] || {}
+        for (const item of filtered) {
+          let key
+          let label
+          if (groupBy === 'tag') {
+            const tags = Array.isArray(item.tags) ? item.tags.filter(Boolean) : []
+            if (tags.length === 0) {
+              key = '__untagged__'
+              label = UNTAGGED_LABEL
+            } else {
+              key = tags[0]
+              label = tags[0]
+            }
+          } else {
+            const value = (item[groupBy] || '').toString() || 'unknown'
+            key = value
+            label = groupBy === 'kind' ? KIND_LABEL[value] || value : groupBy === 'status' ? STATUS_LABEL[value] || value : RISK_LABEL[value] || value
+          }
+          if (!bucket.has(key)) bucket.set(key, { key, label, items: [], order: order[key] === undefined ? 90 : order[key] })
+          bucket.get(key).items.push(item)
+        }
+        const list = Array.from(bucket.values())
+        if (groupBy === 'tag') list.sort((a, b) => b.items.length - a.items.length || a.label.localeCompare(b.label, 'zh'))
+        else list.sort((a, b) => a.order - b.order || a.label.localeCompare(b.label, 'zh'))
+        return list
+      }, [filtered, groupBy])
+
+      const changeGroupBy = useCallback((next) => {
+        setGroupBy(next)
+        try {
+          window.localStorage.setItem(GROUP_STORE_KEY, next)
+        } catch {
+          /* 存不了就算了，只是记不住偏好 */
+        }
+      }, [])
+
+      const toggleCategory = useCallback((key) => {
+        setFoldedCats((prev) => ({ ...prev, [key]: prev[key] !== true }))
+      }, [])
 
       const patchDraft = useCallback((patch) => setDraft((prev) => (prev ? { ...prev, ...patch } : prev)), [])
 
@@ -658,6 +757,47 @@ window.__ModuleLoader__.load({
         }
       }, [overview, refresh, notify])
 
+      // 系统原生「选择文件夹」对话框（和 QQ机器人插件里表情包管理那个一样）。
+      // 选完只回填输入框，点「保存并迁移」/「保存」才真正切换库目录。
+      const chooseFolder = useCallback(
+        async (currentDir) => {
+          setBusy(true)
+          try {
+            const data = await request('/pick-dir', { method: 'POST', body: JSON.stringify({ dir: currentDir || '' }) })
+            const dir = data && typeof data.dir === 'string' ? data.dir : ''
+            if (dir === '') {
+              notify('err', '已取消：没有选择文件夹')
+              return ''
+            }
+            return dir
+          } catch (error) {
+            notify('err', '打开选择文件夹失败：' + error.message)
+            return ''
+          } finally {
+            setBusy(false)
+          }
+        },
+        [notify],
+      )
+
+      const chooseGlobalDir = useCallback(async () => {
+        const dir = await chooseFolder(dirInput !== '' ? dirInput : overview ? overview.globalLibraryDir : '')
+        if (!dir) return
+        setDirInput(dir)
+        notify('ok', '已选择文件夹：' + dir + '（点「保存并迁移」生效）')
+      }, [chooseFolder, dirInput, overview, notify])
+
+      const chooseSessionDir = useCallback(async () => {
+        if (!viewSession) {
+          notify('err', '先选一个会话')
+          return
+        }
+        const dir = await chooseFolder(sessDirInput !== '' ? sessDirInput : overview ? overview.effectiveLibraryDir : '')
+        if (!dir) return
+        setSessDirInput(dir)
+        notify('ok', '已选择文件夹：' + dir + '（点「保存」生效）')
+      }, [chooseFolder, sessDirInput, overview, viewSession, notify])
+
       const exportJson = useCallback(async () => {
         try {
           const bases = apiBase ? [apiBase] : API_CANDIDATES
@@ -821,6 +961,7 @@ window.__ModuleLoader__.load({
               'div',
               { className: 'ml-settings-row' },
               h('input', { className: 'ml-input ml-grow', value: dirInput, onChange: (event) => setDirInput(event.target.value), placeholder: overview ? overview.defaultGlobalLibraryDir : '' }),
+              h('button', { type: 'button', className: 'ml-btn', onClick: chooseGlobalDir, disabled: busy, title: '打开系统的「选择文件夹」对话框，选好自动填到左边' }, '选择文件夹…'),
               h('button', { type: 'button', className: 'ml-btn ml-btn-primary', onClick: changeDir, disabled: busy }, '保存并迁移'),
               h('button', { type: 'button', className: 'ml-btn', onClick: resetDir, disabled: busy }, '恢复默认'),
             ),
@@ -836,6 +977,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setSessDirInput(event.target.value),
                 placeholder: '留空 = 跟随全局（' + (overview ? overview.globalLibraryDir : '') + '）',
               }),
+              h('button', { type: 'button', className: 'ml-btn', onClick: chooseSessionDir, disabled: busy || !viewSession, title: '打开系统的「选择文件夹」对话框，选好自动填到左边' }, '选择文件夹…'),
               h('button', { type: 'button', className: 'ml-btn ml-btn-primary', onClick: saveSessionDir, disabled: busy || !viewSession }, '保存'),
               h('button', { type: 'button', className: 'ml-btn', onClick: followGlobalDir, disabled: busy || !viewSession || !usingOwnLibrary }, '跟随全局'),
             ),
@@ -872,14 +1014,98 @@ window.__ModuleLoader__.load({
           { type: 'button', className: 'ml-btn' + (onlyIssues ? ' ml-btn-active' : ''), onClick: () => setOnlyIssues((value) => !value) },
           '只看有问题的' + (counts.issues ? '（' + counts.issues + '）' : ''),
         ),
+        h(
+          'select',
+          {
+            className: 'ml-input ml-select',
+            value: groupBy,
+            title: '按什么分类显示',
+            onChange: (event) => changeGroupBy(event.target.value),
+          },
+          h('option', { value: 'kind' }, '按类型分组'),
+          h('option', { value: 'tag' }, '按标签分组'),
+          h('option', { value: 'status' }, '按状态分组'),
+          h('option', { value: 'risk' }, '按风险分组'),
+          h('option', { value: 'none' }, '不分组'),
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'ml-btn' + (missesOpen ? ' ml-btn-active' : ''),
+            title: 'AI 搜过但库里没有的事，可以一键转成草稿',
+            onClick: () => {
+              setMissesOpen((value) => !value)
+              if (!missesOpen) void loadMisses()
+            },
+          },
+          '搜不到的' + (misses.length ? '（' + misses.length + '）' : ''),
+        ),
       )
+
+      // 「搜不到」清单：AI 搜空了才记下的，看一眼就知道库里还缺什么
+      const missesPanel =
+        missesOpen && misses.length > 0
+          ? h(
+              'div',
+              { className: 'ml-misses' },
+              h('div', { className: 'ml-misses-head' }, 'AI 搜过、但库里没有的事（点一下转成草稿）'),
+              ...misses.map((item) =>
+                h(
+                  'div',
+                  { key: item.query, className: 'ml-miss-row' },
+                  h('span', { className: 'ml-miss-text', title: item.query }, item.query),
+                  item.count > 1 ? h('span', { className: 'ml-miss-count' }, '×' + item.count) : null,
+                  h(
+                    'button',
+                    { type: 'button', className: 'ml-btn ml-btn-sm', onClick: () => void handleMiss(item.query, false) },
+                    '转草稿',
+                  ),
+                  h(
+                    'button',
+                    { type: 'button', className: 'ml-btn ml-btn-sm', onClick: () => void handleMiss(item.query, true) },
+                    '不要',
+                  ),
+                ),
+              ),
+            )
+          : missesOpen
+            ? h('div', { className: 'ml-misses ml-misses-empty' }, '目前没有搜不到的记录。AI 搜空一次就会记一条到这里。')
+            : null
 
       const list = h(
         'div',
         { className: 'ml-list' },
         filtered.length === 0
           ? h('div', { className: 'ml-empty' }, methods.length === 0 ? '这个会话的库里还没有方法。点「新建」，或让 AI 做完一件事后用 method_save 存一条。' : '没有符合条件的。')
-          : filtered.map((item) => h(ListRow, { key: item.id, item, active: item.id === selectedId, onClick: () => openMethod(item.id) })),
+          : groups.map((group) => {
+              const folded = foldedCats[group.key] === true && groups.length > 1
+              return h(
+                'div',
+                { key: group.key, className: 'ml-cat' },
+                groups.length > 1
+                  ? h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'ml-cat-head' + (folded ? '' : ' ml-cat-head-open'),
+                        onClick: () => toggleCategory(group.key),
+                        title: folded ? '展开这一类' : '收起这一类',
+                      },
+                      h('span', { className: 'ml-cat-caret' }, folded ? '▸' : '▾'),
+                      h('span', { className: 'ml-cat-label' }, group.label),
+                      h('span', { className: 'ml-cat-count' }, String(group.items.length)),
+                    )
+                  : null,
+                folded
+                  ? null
+                  : h(
+                      'div',
+                      { className: 'ml-cat-body' },
+                      group.items.map((item) => h(ListRow, { key: item.id, item, active: item.id === selectedId, onClick: () => openMethod(item.id) })),
+                    ),
+              )
+            }),
       )
 
       const current = draft
@@ -1044,6 +1270,7 @@ window.__ModuleLoader__.load({
         pathBar,
         settings,
         toolbar,
+        missesPanel,
         pickerOpen
           ? h(SessionPicker, {
               sessions,
@@ -1080,6 +1307,13 @@ window.__ModuleLoader__.load({
       .ml-btn:disabled{opacity:.5;cursor:default}
       .ml-btn-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff}
       .ml-btn-active{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
+      .ml-btn-sm{padding:2px 7px;font-size:11px}
+      .ml-misses{padding:8px 14px;border-bottom:1px solid var(--dsw-alias-border-l1);display:flex;flex-direction:column;gap:4px;max-height:180px;overflow:auto}
+      .ml-misses-empty{color:var(--dsw-alias-label-secondary);font-size:12px}
+      .ml-misses-head{font-size:11px;color:var(--dsw-alias-label-secondary);margin-bottom:2px}
+      .ml-miss-row{display:flex;align-items:center;gap:8px}
+      .ml-miss-text{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}
+      .ml-miss-count{font-size:11px;color:var(--dsw-alias-label-secondary);flex:none}
       .ml-btn-on{border-color:var(--dsw-alias-state-success-primary);color:var(--dsw-alias-state-success-primary)}
       .ml-switch-wrap{display:flex;align-items:center;gap:7px}
       .ml-switch-label{font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap}
@@ -1138,6 +1372,14 @@ window.__ModuleLoader__.load({
       .ml-body{display:flex;flex:1;min-height:0}
       .ml-list-wrap{width:360px;min-width:260px;border-right:1px solid var(--dsw-alias-border-l1);overflow:auto}
       .ml-list{display:flex;flex-direction:column;gap:4px;padding:8px}
+      .ml-cat{display:flex;flex-direction:column;gap:2px;min-width:0}
+      .ml-cat-head{display:flex;align-items:center;gap:6px;width:100%;min-width:0;text-align:left;background:transparent;border:1px solid transparent;border-radius:8px;padding:5px 7px;cursor:pointer;color:inherit;font:inherit;font-size:12px;color:var(--dsw-alias-label-secondary)}
+      .ml-cat-head:hover{background:var(--dsw-alias-bg-layer-1)}
+      .ml-cat-head-open{color:var(--dsw-alias-label-primary)}
+      .ml-cat-caret{width:9px;font-size:9px;flex:none;color:var(--dsw-alias-label-secondary)}
+      .ml-cat-label{flex:1;min-width:0;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+      .ml-cat-count{flex:none;font-size:10px;border:1px solid var(--dsw-alias-border-l1);border-radius:999px;padding:0 6px;color:var(--dsw-alias-label-secondary)}
+      .ml-cat-body{display:flex;flex-direction:column;gap:4px;min-width:0;padding-left:2px}
       .ml-row{display:flex;flex-direction:column;gap:4px;text-align:left;background:transparent;border:1px solid transparent;border-radius:8px;padding:8px 10px;cursor:pointer;color:inherit;font:inherit}
       .ml-row:hover{background:var(--dsw-alias-bg-layer-1)}
       .ml-row-active{background:var(--dsw-alias-bg-layer-1);border-color:var(--dsw-alias-brand-primary)}
